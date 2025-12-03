@@ -1,115 +1,123 @@
 import streamlit as st
 import sqlite3
 import pandas as pd
-import plotly.express as px
+import datetime
+import io
+import json
 import os
-from datetime import date
+import glob
+import time
+import re
 
-st.set_page_config(
-    page_title="LabNexus V48 - 实验室大脑",
-    page_icon="DNA",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ================= 1. 全局配置 =================
+st.set_page_config(page_title="LabNexus V46", page_icon="🧬", layout="wide")
+
+STANDARD_METRICS = [
+    "大蒜辣素含量", "蒜氨酸含量", "水分", 
+    "耐酸力", "累计溶出度", "增重"
+]
 
 st.markdown("""
 <style>
-    .main > div {padding-top: 2rem;}
-    .stButton>button {border-radius: 12px; height: 3em; font-weight: bold; width: 100%;}
-    .exp-header {background: linear-gradient(120deg, #667eea 0%, #764ba2 100%); color: white; padding: 1.5rem; border-radius: 15px; margin: 2rem 0; text-align: center; font-size: 2rem;}
+    .stApp {font-family: 'Roboto', sans-serif;}
+    .metric-card {
+        background-color: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px;
+        padding: 15px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .metric-label { color: #6c757d; font-size: 0.85rem; font-weight: 500; margin-bottom: 5px; }
+    .metric-value { color: #2c3e50; font-size: 1.4rem; font-weight: bold; }
+    .exp-card {
+        background: white; border-radius: 8px; padding: 12px; margin-bottom: 8px;
+        border-left: 4px solid #0d6efd; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    }
+    .slicer-box {
+        border: 1px dashed #aaa; padding: 15px; border-radius: 10px; margin-top: 10px;
+        background-color: #f8f9fa;
+    }
+    .add-btn-area {
+        margin-top: 10px; padding-top: 10px; border-top: 1px dashed #eee; text-align: right;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-DB_NAME = "data/lab_nexus_data.db"
-if not os.path.exists("data"):
-    os.makedirs("data")
+# ================= 2. 数据库层 =================
 
 @st.cache_resource
-def get_conn():
-    return sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
+def get_db_connection_cached(db_path):
+    return sqlite3.connect(db_path, check_same_thread=False)
 
-def run_query(sql, params=(), fetch=False):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(sql, params)
+def get_active_db_path():
+    if 'active_db' in st.session_state and os.path.exists(st.session_state['active_db']):
+        return st.session_state['active_db']
+    priority = "lab_nexus_v25.db"
+    if os.path.exists(priority): return priority
+    files = glob.glob("*.db")
+    if files: return max(files, key=os.path.getsize)
+    return "lab_nexus.db"
+
+def run_query(query, params=(), fetch=True):
+    db_path = get_active_db_path()
+    conn = get_db_connection_cached(db_path)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, params)
         if fetch:
-            return cur.fetchall()
+            res = cursor.fetchall()
+            return res
         conn.commit()
-        return cur.lastrowid
+        return cursor.lastrowid
+    except Exception as e:
+        st.error(f"DB Error: {e}")
+        return None
 
 def init_db():
-    if st.session_state.get("db_ready"):
-        return
-    conn = get_conn()
-    conn.executescript('''
-    CREATE TABLE IF NOT EXISTS experiments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        project TEXT, title TEXT, batch_no TEXT, date TEXT,
-        status TEXT DEFAULT '进行中', created_at TEXT DEFAULT (datetime('now','localtime'))
-    );
-    CREATE TABLE IF NOT EXISTS samples (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        exp_id INTEGER, sample_name TEXT, sort_order INTEGER,
-        FOREIGN KEY(exp_id) REFERENCES experiments(id) ON DELETE CASCADE
-    );
-    ''')
-    conn.commit()
-    st.session_state.db_ready = True
-    st.success("LabNexus V48 启动成功！数据库已准备就绪")
+    run_query('''CREATE TABLE IF NOT EXISTS experiments (id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT, title TEXT, batch_no TEXT, date TEXT, status TEXT, tags TEXT, variables TEXT, conclusion TEXT, notes TEXT, searchable_metrics TEXT)''', fetch=False)
+    run_query('''CREATE TABLE IF NOT EXISTS attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, exp_id INTEGER, filename TEXT, file_type TEXT, file_data BLOB, FOREIGN KEY(exp_id) REFERENCES experiments(id) ON DELETE CASCADE)''', fetch=False)
+    run_query('''CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, created_at TEXT, description TEXT)''', fetch=False)
+    try:
+        exps = run_query("SELECT DISTINCT project FROM experiments")
+        for p in exps:
+            if p[0]: run_query("INSERT OR IGNORE INTO projects (name, created_at) VALUES (?, ?)", (p[0], datetime.date.today()), fetch=False)
+    except: pass
 
-init_db()
+# ================= 3. 业务逻辑 =================
 
-with st.sidebar:
-    st.markdown("<h1 style='color:#667eea;text-align:center;'>DNA LabNexus V48</h1>", unsafe_allow_html=True)
-    if st.button("新建实验", type="primary", use_container_width=True):
-        st.session_state.mode = "new"
-    total = len(run_query("SELECT id FROM experiments", fetch=True) or [])
-    st.caption(f"实验总数：{total}")
+def get_projects():
+    res = run_query("SELECT name FROM projects ORDER BY created_at DESC")
+    return [r[0] for r in res] if res else []
 
-st.markdown("<div class='exp-header'>实验列表</div>", unsafe_allow_html=True)
+def create_proj(name):
+    run_query("INSERT INTO projects VALUES (?, ?, ?)", (name, datetime.date.today(), ""), fetch=False)
 
-if st.session_state.get("mode") == "new":
-    with st.form("new_exp"):
-        c1, c2 = st.columns(2)
-        with c1:
-            project = st.text_input("项目名称", "大蒜深加工")
-            title = st.text_input("实验标题", "酶解条件优化")
-        with c2:
-            batch = st.text_input("批号", "2025-003")
-            d = st.date_input("日期", date.today())
-        tmp = st.selectbox("模板", ["6个平行样", "3组×3重复", "时间序列", "空白"])
-        if st.form_submit_button("创建实验"):
-            eid = run_query("INSERT INTO experiments (project,title,batch_no,date) VALUES (?,?,?,?)",
-                           (project, title, batch, str(d)))
-            samples = {
-                "6个平行样": [f"样品{i}" for i in range(1,7)],
-                "3组×3重复": [f"{g}{r}" for g in ["A","B","C"] for r in range(1,4)],
-                "时间序列": ["0h","2h","4h","8h","12h","24h"],
-                "空白": ["样品1"]
-            }[tmp]
-            for i, s in enumerate(samples):
-                run_query("INSERT INTO samples (exp_id, sample_name, sort_order) VALUES (?,?,?)", (eid, s, i+1))
-            st.success(f"创建成功！ID: {eid}")
-            st.session_state.current_exp = eid
-            st.session_state.mode = None
-            st.rerun()
+def save_experiment_atomic(data, files, metrics):
+    mj = json.dumps(metrics)
+    cid = data.get('id')
+    
+    # 🔴 V46 修复：强制转换日期格式，防止 Timestamp 报错
+    raw_date = data.get('date')
+    if hasattr(raw_date, 'strftime'):
+        date_str = raw_date.strftime("%Y-%m-%d")
+    else:
+        date_str = str(raw_date)
 
-exps = run_query("SELECT id, title, batch_no, date FROM experiments ORDER BY id DESC", fetch=True) or []
-for e in exps:
-    eid, title, batch, d = e
-    with st.container():
-        c1, c2 = st.columns([5,1])
-        with c1:
-            st.write(f"**{title}** | {batch} | {d}")
-        with c2:
-            if st.button("进入", key=eid):
-                st.session_state.current_exp = eid
-                st.rerun()
+    safe_data = {
+        'project': data.get('project', ''),
+        'title': data.get('title', ''),
+        'batch_no': data.get('batch_no', ''),
+        'date': date_str, # 使用转换后的字符串
+        'status': data.get('status', 'pending'),
+        'tags': data.get('tags', ''),
+        'variables': data.get('variables', ''),
+        'conclusion': data.get('conclusion', ''),
+        'notes': data.get('notes', '')
+    }
+    
+    if cid:
+        run_query('''UPDATE experiments SET project=?, title=?, batch_no=?, date=?, status=?, tags=?, variables=?, conclusion=?, notes=?, searchable_metrics=? WHERE id=?''',
+            (safe_data['project'], safe_data['title'], safe_data['batch_no'], safe_data['date'], safe_data['status'], safe_data['tags'], safe_data['variables'], safe_data['conclusion'], safe_data['notes'], mj, cid), fetch=False)
+    else:
+        cid = run_query('''INSERT INTO experiments (project, title, batch_no, date, status, tags, variables, conclusion, notes, searchable_metrics) VALUES (?,?,?,?,?,?,?,?,?,?)''',
+            (safe_data['project'], safe_data['title'], safe_data['batch_no'], safe_data['date'], safe_data['status'], safe_data['tags'], safe_data['variables'], safe_data['conclusion'], safe_data['notes'], mj), fetch=False)
 
-if st.session_state.get("current_exp"):
-    eid = st.session_state.current_exp
-    info = run_query("SELECT title FROM experiments WHERE id=?", (eid,), fetch=True)[0][0]
-    st.markdown(f"# {info}")
-    if st.button("返回列表"):
-        st.session_state.pop("current_exp", None)
-        st.rerun()
+    if files:
+  
