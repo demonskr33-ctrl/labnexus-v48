@@ -4,37 +4,185 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import plotly.express as px
-import json
 import os
 from datetime import datetime, date
-import base64
-from io import BytesIO
 
 # ================= 配置 =================
 st.set_page_config(
     page_title="LabNexus V48 - 实验室大脑",
-    page_icon="🧬",
+    page_icon="DNA",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 美化 CSS
+# 美化
 st.markdown("""
 <style>
     .main > div {padding-top: 2rem;}
     .stButton>button {border-radius: 12px; height: 3em; font-weight: bold; width: 100%;}
     .success-box {background: linear-gradient(90deg, #d4edda, #c3e6cb); padding: 1.2rem; border-radius: 12px; border-left: 6px solid #28a745; margin: 1rem 0;}
     .exp-header {background: linear-gradient(120deg, #667eea 0%, #764ba2 100%); color: white; padding: 1.5rem; border-radius: 15px; margin: 2rem 0; text-align: center; font-size: 2rem;}
-    .metric-card {background: white; padding: 1.5rem; border-radius: 15px; box-shadow: 0 6px 20px rgba(0,0,0,0.1); text-align: center; margin: 1rem 0;}
 </style>
 """, unsafe_allow_html=True)
 
-DB_NAME = "data/lab_nexus_data.db"   # 关键！放在 data 文件夹里才永久保存
-STANDARD_METRICS = ["大蒜辣素含量", "蒜氨酸含量", "水分", "耐酸力", "累计溶出度", "增重", "pH"]
-
-# 确保 data 文件夹存在（Streamlit Cloud 特殊处理）
+# 数据库路径（关键！放在 data 文件夹才不会丢失）
+DB_NAME = "data/lab_nexus_data.db"
 if not os.path.exists("data"):
     os.makedirs("data")
+
+@st.cache_resource
+def get_conn():
+    return sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
+
+def run_query(sql, params=(), fetch=False):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        if fetch:
+            return cur.fetchall()
+        conn.commit()
+        return cur.lastrowid
+
+# ================= 数据库初始化 =================
+def init_db():
+    if st.session_state.get("db_ready"):
+        return
+    conn = get_conn()
+    conn.executescript('''
+    CREATE TABLE IF NOT EXISTS experiments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project TEXT, 
+        title TEXT, 
+        batch_no TEXT, 
+        date TEXT,
+        status TEXT DEFAULT '进行中', 
+        tags TEXT, 
+        conclusion TEXT, 
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now', 'localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exp_id INTEGER, 
+        sample_name TEXT, 
+        group_name TEXT, 
+        replicate INTEGER, 
+        sort_order INTEGER,
+        FOREIGN KEY(exp_id) REFERENCES experiments(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS sample_metrics (
+        sample_id INTEGER, 
+        metric_name TEXT, 
+        value REAL,
+        PRIMARY KEY (sample_id, metric_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exp_id INTEGER, 
+        filename TEXT, 
+        file_data BLOB,
+        uploaded_at TEXT DEFAULT (datetime('now', 'localtime'))
+    );
+    ''')
+    conn.commit()
+    st.session_state.db_ready = True
+    st.success("LabNexus V48 已就绪！后Excel时代来临！")
+
+init_db()
+
+# ================= 侧边栏 =================
+with st.sidebar:
+    st.markdown("<h1 style='color:#667eea; text-align:center;'>DNA LabNexus V48</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center; color:#888;'>你的实验室，终于有了大脑</p>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    if st.button("新建实验", type="primary", use_container_width=True):
+        st.session_state.mode = "new"
+        st.session_state.pop("current_exp", None)
+    
+    st.markdown("---")
+    total = len(run_query("SELECT id FROM experiments", fetch=True) or [])
+    st.caption(f"数据库：`{DB_NAME}` | 实验总数：**{total}**")
+
+# ================= 主界面 =================
+st.markdown("<div class='exp-header'>实验列表</div>", unsafe_allow_html=True)
+
+# 新建实验
+if st.session_state.get("mode") == "new":
+    with st.form("new_exp_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            project = st.text_input("项目名称", "大蒜深加工")
+            title = st.text_input("实验标题", "酶解条件优化实验")
+        with c2:
+            batch_no = st.text_input("批号", "2025-003")
+            exp_date = st.date_input("日期", date.today())
+
+        template = st.selectbox("样品模板", ["6个平行样", "3组×3重复", "时间序列", "空白模板"])
+
+        if st.form_submit_button("创建实验"):
+            exp_id = run_query("INSERT INTO experiments (project, title, batch_no, date) VALUES (?,?,?,?)",
+                               (project, title, batch_no, str(exp_date)))
+            
+            samples_map = {
+                "6个平行样": [f"平行样{i}" for i in range(1,7)],
+                "3组×3重复": [f"{g}-重复{r}" for g in ["对照","加酶","高温"] for r in range(1,4)],
+                "时间序列": ["0h","2h","4h","8h","12h","24h"],
+                "空白模板": ["样品1"]
+            }
+            
+            for i, name in enumerate(samples_map[template]):
+                run_query("INSERT INTO samples (exp_id, sample_name, sort_order) VALUES (?,?,?)",
+                          (exp_id, name, i+1))
+            
+            st.success(f"实验创建成功！ID: {exp_id}")
+            st.session_state.current_exp = exp_id
+            st.session_state.mode = None
+            st.rerun()
+
+# 实验列表
+exps = run_query("SELECT id, title, batch_no, date, status FROM experiments ORDER BY id DESC", fetch=True) or []
+
+if not exps:
+    st.info("还没有实验，点击左侧按钮新建一个吧！")
+else:
+    for exp in exps:
+        eid, title, batch, exp_date, status = exp
+        with st.container():
+            col1, col2, col3 = st.columns([4, 2, 2])
+            with col1:
+                st.markdown(f"**{title}**")
+                st.caption(f"批号：{batch or '无'} | 日期：{exp_date}")
+            with col2:
+                st.write(f"状态：`{status}`")
+            with col3:
+                if st.button("进入", key=f"enter_{eid}", use_container_width=True):
+                    st.session_state.current_exp = eid
+                    st.rerun()
+
+# 实验详情页（占位）
+if st.session_state.get("current_exp"):
+    exp_id = st.session_state.current_exp
+    info = run_query("SELECT title, project, batch_no, date FROM experiments WHERE id=?", (exp_id,), fetch=True)[0]
+    title, project, batch, exp_date = info
+    
+    st.markdown(f"# {title}")
+    st.markdown(f"**项目**：{project} | **批号**：{batch} | **日期**：{exp_date}")
+    
+    tab1, tab2, tab3 = st.tabs(["数据录入", "图表分析", "附件与导出"])
+    with tab1:
+        st.info("数据录入功能开发中…")
+    with tab2:
+        st.info("自动图表功能开发中…")
+    with tab3:
+        st.info("附件上传与Excel导出开发中…")
+    
+    if st.button("返回实验列表"):
+        st.session_state.pop("current_exp", None)
+        st.rerun()    os.makedirs("data")
 
 @st.cache_resource
 def get_conn():
