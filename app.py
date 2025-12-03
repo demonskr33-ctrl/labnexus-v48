@@ -1,5 +1,4 @@
-# app.py  ——  LabNexus V48 终极版（公网部署专用）
-# 直接复制全部内容保存为 app.py 即可
+# app.py —— LabNexus V48 终极版（2025最新 · 公网零错误部署专用）
 
 import streamlit as st
 import sqlite3
@@ -9,32 +8,196 @@ import json
 import os
 from datetime import datetime, date
 import base64
+from io import BytesIO
 
 # ================= 配置 =================
 st.set_page_config(
     page_title="LabNexus V48 - 实验室大脑",
-    page_icon="DNA",
+    page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 美化
+# 美化 CSS
 st.markdown("""
 <style>
     .main > div {padding-top: 2rem;}
-    .stButton>button {border-radius: 8px; height: 3em; font-weight: bold;}
-    .success-box {background: linear-gradient(90deg, #d4edda, #c3e6cb); padding: 1rem; border-radius: 10px; border-left: 5px solid #28a745;}
-    .exp-header {background: linear-gradient(120deg, #667eea 0%, #764ba2 100%); color: white; padding: 1.2rem; border-radius: 12px; margin: 1rem 0; text-align: center;}
-    .metric-card {background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); text-align: center;}
+    .stButton>button {border-radius: 12px; height: 3em; font-weight: bold; width: 100%;}
+    .success-box {background: linear-gradient(90deg, #d4edda, #c3e6cb); padding: 1.2rem; border-radius: 12px; border-left: 6px solid #28a745; margin: 1rem 0;}
+    .exp-header {background: linear-gradient(120deg, #667eea 0%, #764ba2 100%); color: white; padding: 1.5rem; border-radius: 15px; margin: 2rem 0; text-align: center; font-size: 2rem;}
+    .metric-card {background: white; padding: 1.5rem; border-radius: 15px; box-shadow: 0 6px 20px rgba(0,0,0,0.1); text-align: center; margin: 1rem 0;}
 </style>
 """, unsafe_allow_html=True)
 
-DB_NAME = "lab_nexus_data.db"
+DB_NAME = "data/lab_nexus_data.db"   # 关键！放在 data 文件夹里才永久保存
 STANDARD_METRICS = ["大蒜辣素含量", "蒜氨酸含量", "水分", "耐酸力", "累计溶出度", "增重", "pH"]
+
+# 确保 data 文件夹存在（Streamlit Cloud 特殊处理）
+if not os.path.exists("data"):
+    os.makedirs("data")
 
 @st.cache_resource
 def get_conn():
-    return sqlite3.connect(DB_NAME, check_same_thread=False, timeout=20)
+    return sqlite3.connect(DB_NAME, check_same_thread=False, timeout=30)
+
+def run_query(sql, params=(), fetch=False):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        if fetch:
+            return cur.fetchall()
+        conn.commit()
+        return cur.lastrowid
+
+# ================= 数据库初始化（已修复 AUTOIN8INCREMENT） =================
+def init_db():
+    if st.session_state.get("db_ready"):
+        return
+    conn = get_conn()
+    conn.executescript('''
+    CREATE TABLE IF NOT EXISTS experiments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project TEXT, 
+        title TEXT, 
+        batch_no TEXT, 
+        date TEXT,
+        status TEXT DEFAULT '进行中', 
+        tags TEXT, 
+        conclusion TEXT, 
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now', 'localtime'))
+    );
+
+    CREATE TABLE IF NOT EXISTS samples (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exp_id INTEGER, 
+        sample_name TEXT, 
+        group_name TEXT, 
+        replicate INTEGER, 
+        sort_order INTEGER,
+        FOREIGN KEY(exp_id) REFERENCES experiments(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS sample_metrics (
+        sample_id INTEGER, 
+        metric_name TEXT, 
+        value REAL,
+        PRIMARY KEY (sample_id, metric_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exp_id INTEGER, 
+        filename TEXT, 
+        file_data BLOB,
+        uploaded_at TEXT DEFAULT (datetime('now', 'localtime')),
+        FOREIGN KEY(exp_id) REFERENCES experiments(id) ON DELETE CASCADE
+    );
+    ''')
+    conn.commit()
+    st.session_state.db_ready = True
+    st.success("🚀 LabNexus V48 已就绪！后Excel时代正式开启！")
+
+init_db()
+
+# ================= 侧边栏 =================
+with st.sidebar:
+    st.markdown("<h1 style='color:#667eea; text-align:center;'>🧬 LabNexus V48</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center; color:#888;'>你的实验室，终于有了大脑</p>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    if st.button("✨ 新建实验", type="primary", use_container_width=True):
+        st.session_state.mode = "new"
+        st.session_state.pop("current_exp", None)
+    
+    st.markdown("---")
+    total_exps = len(run_query("SELECT id FROM experiments", fetch=True) or [])
+    st.caption(f"📊 数据库：`{DB_NAME}` | 实验总数：**{total_exps}**")
+
+# ================= 主界面 =================
+st.markdown("<div class='exp-header'>🧪 实验列表</div>", unsafe_allow_html=True)
+
+# 新建实验模式
+if st.session_state.get("mode") == "new":
+    with st.form("新建实验表单"):
+        col1, col2 = st.columns(2)
+        with col1:
+            project = st.text_input("项目名称", value="大蒜深加工", help="如：大蒜深加工、中药提取等")
+            title = st.text_input("实验标题", value="酶解条件优化实验")
+        with col2:
+            batch_no = st.text_input("批号", value="2025-003")
+            exp_date = st.date_input("实验日期", date.today())
+
+        template = st.selectbox("选择样品模板", [
+            "6个平行样",
+            "3组×3重复（对照/加酶/高温）",
+            "时间序列（0-24h）",
+            "空白模板（手动添加）"
+        ])
+
+        submitted = st.form_submit_button("🚀 创建新实验")
+        if submitted:
+            exp_id = run_query(
+                "INSERT INTO experiments (project, title, batch_no, date) VALUES (?,?,?,?)",
+                (project, title, batch_no, str(exp_date))
+            )
+            
+            templates = {
+                "6个平行样": [f"平行样{i}" for i in range(1,7)],
+                "3组×3重复（对照/加酶/高温）": [f"{g}-重复{r}" for g in ["对照","加酶","高温"] for r in range(1,4)],
+                "时间序列（0-24h）": ["0h","2h","4h","8h","12h","24h"],
+                "空白模板（手动添加）": ["样品1"]
+            }
+            
+            for i, name in enumerate(templates[template]):
+                run_query("INSERT INTO samples (exp_id, sample_name, sort_order) VALUES (?,?,?)", 
+                         (exp_id, name, i+1))
+            
+            st.success(f"实验创建成功！ID: {exp_id}")
+            st.session_state.current_exp = exp_id
+            st.session_state.mode = None
+            st.rerun()
+
+# 显示实验列表
+exps = run_query("SELECT id, title, batch_no, date, status FROM experiments ORDER BY id DESC", fetch=True) or []
+
+if not exps:
+    st.info("暂无实验，点击左侧 ✨ 新建实验 开始吧！")
+else:
+    for exp in exps[:200]:
+        eid, title, batch, exp_date, status = exp
+        with st.container():
+            cols = st.columns([4, 2, 1.5, 1.5])
+            with cols[0]:
+                st.markdown(f"**{title}**")
+                st.caption(f"批号：{batch or '未填写'} | 日期：{exp_date}")
+            with cols[1]:
+                st.write(f"状态：`{status}`")
+            with cols[2]:
+                if st.button("进入编辑", key=f"edit_{eid}", use_container_width=True):
+                    st.session_state.current_exp = eid
+                    st.rerun()
+            with cols[3]:
+                if st.button("📊 查看", key=f"view_{eid}", use_container_width=True):
+                    st.session_state.current_exp = eid
+                    st.session_state.view_mode = True
+                    st.rerun()
+
+# 如果选中了某个实验，进入详情页（占位，后面你再继续扩展）
+if st.session_state.get("current_exp"):
+    exp_id = st.session_state.current_exp
+    exp_info = run_query("SELECT title, project, batch_no, date FROM experiments WHERE id=?", (exp_id,), fetch=True)[0]
+    title, project, batch, exp_date = exp_info
+    
+    st.markdown(f"# 🧪 {title}")
+    st.markdown(f"**项目**：{project} | **批号**：{batch} | **日期**：{exp_date}")
+    
+    st.info("功能开发中… 后续将支持：数据录入、自动图表、附件上传、导出Excel等完整功能！")
+    
+    if st.button("返回实验列表"):
+        st.session_state.pop("current_exp", None)
+        st.session_state.pop("view_mode", None)
+        st.rerun()    return sqlite3.connect(DB_NAME, check_same_thread=False, timeout=20)
 
 def run_query(sql, params=(), fetch=False):
     with get_conn() as conn:
