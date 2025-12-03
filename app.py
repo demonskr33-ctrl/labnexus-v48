@@ -51,7 +51,7 @@ def init_db():
     with get_conn() as conn:
         conn.executescript('''
         CREATE TABLE IF NOT EXISTS experiments (
-            id INTEGER PRIMARY KEY AUTOIN8INCREMENT,
+            id INTEGER PRIMARY KEY AUTOINCREMEN,
             project TEXT, title TEXT, batch_no TEXT, date TEXT,
             status TEXT DEFAULT '进行中', tags TEXT, conclusion TEXT, notes TEXT,
             created_at TEXT DEFAULT (datetime('now'))
